@@ -1,15 +1,12 @@
-#!/usr/bin/env python3
-
-import urllib.request
-import urllib.parse
-import base64
-import time
+import paramiko
 import os
+import time
 
 USERNAME = os.getenv("KEENETIC_USERNAME", "admin")
 PASSWORD = os.getenv("KEENETIC_PASSWORD", None)
 KEENETIC_HOST = os.getenv("KEENETIC_HOST", "192.168.0.1")
-INTERFACE = os.getenv("KEENETIC_INTERFACE", "Proxy0")
+KEENETIC_PORT = os.getenv("KEENETIC_PORT", 22)
+KEENTIC_INTERFACE = os.getenv("KEENTIC_INTERFACE", "Proxy0")
 
 CUSTOM_CIDR_LIST = [
     # Youtube
@@ -29,94 +26,83 @@ CUSTOM_CIDR_LIST = [
 
 
 def cidr_to_netmask(cidr):
-    """Преобразует префикс CIDR в маску подсети."""
-    try:
-        ip, prefix_length = cidr.split("/")
-        prefix_length = int(prefix_length)
-
-        # Создаем маску подсети из префикса
-        mask = (0xFFFFFFFF >> (32 - prefix_length)) << (32 - prefix_length)
-        netmask = ".".join([str((mask >> (i * 8)) & 0xFF) for i in range(4)[::-1]])
-
-        return ip, netmask
-    except ValueError:
-        raise ValueError("Неверный формат CIDR")
+    ip, prefix_length = cidr.split("/")
+    prefix_length = int(prefix_length)
+    mask = (0xFFFFFFFF >> (32 - prefix_length)) << (32 - prefix_length)
+    netmask = ".".join([str((mask >> (i * 8)) & 0xFF) for i in range(4)[::-1]])
+    return ip, netmask
 
 
 def fetch_cidr_list(url):
-    """Загружает список CIDR из указанного URL."""
-    with urllib.request.urlopen(url) as response:
-        return response.read().decode().splitlines()
+    import requests
+
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.text.splitlines()
 
 
-def add_route_to_keenetic(ip, netmask, gateway, username, password):
-    """Добавляет маршрут на роутер Keenetic с использованием GET-запроса."""
-    url = f"http://{KEENETIC_HOST}/cgi-bin/luci/admin/network/routes"
-    params = {"ip": ip, "mask": netmask, "gateway": gateway, "interface": INTERFACE}
+def execute_command(ssh, command, retries=3):
+    attempt = 0
+    while attempt < retries:
+        try:
+            stdin, stdout, stderr = ssh.exec_command(command)
+            error = stderr.read()
+            if error:
+                print(f"Ошибка: {error.decode()}")
+            return stdout.read().decode()
+        except paramiko.SSHException as e:
+            if "Channel closed" in str(e):
+                print(f"Channel closed detected. Retrying... ({attempt + 1}/{retries})")
+                attempt += 1
+                time.sleep(1)
+            else:
+                raise e
+    raise Exception(f"Failed to execute command after {retries} attempts: {command}")
 
-    # Кодируем параметры для URL
-    query_string = urllib.parse.urlencode(params)
-    full_url = f"{url}?{query_string}"
 
-    # Создаем запрос
-    request = urllib.request.Request(full_url)
-    request.add_header("Content-Type", "application/x-www-form-urlencoded")
+def add_routes_via_ssh(routes):
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    # Аутентификация
-    credentials = f"{username}:{password}"
-    base64_credentials = base64.b64encode(credentials.encode()).decode()
-    request.add_header("Authorization", f"Basic {base64_credentials}")
-
-    # Отправка запроса
     try:
-        with urllib.request.urlopen(request) as response:
-            print(f"Маршрут {ip} с маской {netmask} успешно добавлен.")
-            return True
+        print("Connecting to Keenetic")
+        ssh.connect(
+            KEENETIC_HOST, port=KEENETIC_PORT, username=USERNAME, password=PASSWORD
+        )
+        print("Connected")
+
+        for ip, netmask in routes:
+            print(f"Добавление маршрута: {ip} {netmask}")
+            command = f"no ip route {ip} {netmask}"
+            execute_command(ssh, command)
+            command = f"ip route {ip} {netmask} {KEENTIC_INTERFACE}"
+            execute_command(ssh, command)
+
+        print("Все маршруты добавлены.")
     except Exception as e:
-        print(f"Ошибка при добавлении маршрута {ip}: {e}")
-        return False
-
-
-def add_routes_to_keenetic(routes, gateway, username, password, max_retries=3):
-    """Добавляет маршруты на роутер Keenetic с повторными попытками."""
-    for route in routes:
-        ip, netmask = route
-        success = False
-        attempts = 0
-
-        while not success and attempts < max_retries:
-            success = add_route_to_keenetic(ip, netmask, gateway, username, password)
-            if not success:
-                attempts += 1
-                print(f"Попытка {attempts} для маршрута {ip}.")
-                time.sleep(2)  # Задержка перед повторной попыткой
+        print(f"Ошибка при подключении или выполнении команд: {e}")
+    finally:
+        ssh.close()
 
 
 def main():
     url = "https://antifilter.download/list/allyouneed.lst"
-    if PASSWORD is None:
-        print(
-            "Для использования данного скрипта необходимо установить переменные окружения KEENETIC_USERNAME и KEENETIC_PASSWORD."
-        )
-        return
 
     try:
         cidr_list = fetch_cidr_list(url)
         cidr_list.extend(CUSTOM_CIDR_LIST)
+
         routes_to_add = []
 
-        # Генерируем маршруты
         for cidr in cidr_list:
-            if cidr.strip():  # Проверяем, что строка не пустая
+            if cidr.strip():
                 ip, netmask = cidr_to_netmask(cidr.strip())
                 routes_to_add.append((ip, netmask))
 
-        # Добавляем маршруты пачками
-        add_routes_to_keenetic(routes_to_add, KEENETIC_HOST, USERNAME, PASSWORD)
+        add_routes_via_ssh(routes_to_add)
     except Exception as e:
         print(f"Ошибка: {e}")
 
 
-# Пример использования
 if __name__ == "__main__":
     main()
